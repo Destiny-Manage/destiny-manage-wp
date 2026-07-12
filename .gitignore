@@ -1,0 +1,10 @@
+# Build output
+dist/
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
