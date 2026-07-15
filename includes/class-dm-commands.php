@@ -151,10 +151,10 @@ class DM_Commands {
         try {
             switch ($type) {
                 case 'update_plugin':
-                    [$result, $error] = self::update_plugin($slug);
+                    [$result, $error] = self::update_plugin($slug, $ver);
                     break;
                 case 'update_theme':
-                    [$result, $error] = self::update_theme($slug);
+                    [$result, $error] = self::update_theme($slug, $ver);
                     break;
                 case 'update_core':
                     [$result, $error] = self::update_core($ver);
@@ -206,6 +206,11 @@ class DM_Commands {
      */
     private static function friendly_error_message(string $slug, string $raw_message): string {
         $haystack = strtolower($raw_message);
+        // Messages this class crafted itself are already actionable — don't
+        // wrap them a second time just because they mention the word license.
+        if (str_contains($haystack, 'check that its license') || str_contains($haystack, 'check the license')) {
+            return $raw_message;
+        }
         $license_hints = ['license', 'licence', 'expired', 'subscription', 'not activated', 'activation', 'unauthorized', 'invalid key'];
         foreach ($license_hints as $hint) {
             if (str_contains($haystack, $hint)) {
@@ -246,7 +251,7 @@ class DM_Commands {
     // Plugin update — crash-safe
     // -------------------------------------------------------------------------
 
-    private static function update_plugin(string $slug): array {
+    private static function update_plugin(string $slug, ?string $target_version = null): array {
         self::load_upgrade_functions();
 
         $plugin_file = self::find_plugin_file($slug);
@@ -259,7 +264,17 @@ class DM_Commands {
 
         $updates = get_plugin_updates();
         if (!isset($updates[$plugin_file])) {
-            return ["Already at latest version.", null];
+            // Licensed plugins with an inactive license often hide their
+            // update from WordPress entirely instead of failing. If the
+            // dashboard asked for a newer version than what's installed and
+            // this site can't even see that update, that's a failure — not
+            // "already updated".
+            $installed = get_plugins()[$plugin_file]['Version'] ?? null;
+            if ($target_version && $installed && version_compare($installed, $target_version, '<')) {
+                return [null, "This site doesn't see an update for {$slug} (installed v{$installed}, expected v{$target_version}). "
+                    . "Licensed plugins hide their updates when the license or subscription is inactive — check the license on the site, then try again."];
+            }
+            return ["Already at latest version" . ($installed ? " (v{$installed})" : "") . ".", null];
         }
 
         $prev_version = get_plugins()[$plugin_file]['Version'] ?? 'unknown';
@@ -294,20 +309,24 @@ class DM_Commands {
             ];
         }
 
+        // version_compare instead of strict inequality: fail only when the
+        // site is still behind the expected version (e.g. the update server
+        // silently re-served the current package), but accept the upgrader
+        // having delivered something even newer than the transient promised.
         $installed_version = self::installed_plugin_version($plugin_file);
-        if ($installed_version !== $new_version) {
+        if (!$installed_version || version_compare($installed_version, $new_version, '<')) {
             return [null, self::version_mismatch_message('Update', $new_version, $installed_version)];
         }
 
         $backup_note = $backup ? "Backed up v{$prev_version} before updating. " : "";
-        return ["{$backup_note}Updated {$slug} from v{$prev_version} to v{$new_version}.", null];
+        return ["{$backup_note}Updated {$slug} from v{$prev_version} to v{$installed_version}.", null];
     }
 
     // -------------------------------------------------------------------------
     // Theme update — crash-safe
     // -------------------------------------------------------------------------
 
-    private static function update_theme(string $slug): array {
+    private static function update_theme(string $slug, ?string $target_version = null): array {
         self::load_upgrade_functions();
 
         wp_clean_themes_cache(true);
@@ -315,7 +334,15 @@ class DM_Commands {
 
         $updates = get_theme_updates();
         if (!isset($updates[$slug])) {
-            return ["Already at latest version.", null];
+            // Same license-hidden-update detection as plugins: commercial
+            // themes drop their update entry when the license lapses.
+            $all_themes = wp_get_themes();
+            $installed  = isset($all_themes[$slug]) ? $all_themes[$slug]->get('Version') : null;
+            if ($target_version && $installed && version_compare($installed, $target_version, '<')) {
+                return [null, "This site doesn't see an update for theme {$slug} (installed v{$installed}, expected v{$target_version}). "
+                    . "Licensed themes hide their updates when the license or subscription is inactive — check the license on the site, then try again."];
+            }
+            return ["Already at latest version" . ($installed ? " (v{$installed})" : "") . ".", null];
         }
 
         $themes      = wp_get_themes();
@@ -343,12 +370,12 @@ class DM_Commands {
         }
 
         $installed_version = self::installed_theme_version($slug);
-        if ($installed_version !== $new_version) {
+        if (!$installed_version || version_compare($installed_version, $new_version, '<')) {
             return [null, self::version_mismatch_message('Update', $new_version, $installed_version)];
         }
 
         $backup_note = $backup ? "Backed up v{$prev_version} before updating. " : "";
-        return ["{$backup_note}Updated theme {$slug} from v{$prev_version} to v{$new_version}.", null];
+        return ["{$backup_note}Updated theme {$slug} from v{$prev_version} to v{$installed_version}.", null];
     }
 
     // -------------------------------------------------------------------------

@@ -7,7 +7,15 @@ defined('ABSPATH') || exit;
  */
 class DM_Updater {
 
+    private const TRANSIENT_KEY = 'dm_plugin_update_check';
+
     private static ?object $remote_data = null;
+
+    /** Drop the cached version-check (used when WP does a forced re-check). */
+    public static function flush_cache(): void {
+        delete_transient(self::TRANSIENT_KEY);
+        self::$remote_data = null;
+    }
 
     /**
      * Fetch version info from the Destiny Manage API (cached per request).
@@ -17,7 +25,7 @@ class DM_Updater {
             return self::$remote_data;
         }
 
-        $transient_key = 'dm_plugin_update_check';
+        $transient_key = self::TRANSIENT_KEY;
         $cached        = get_transient($transient_key);
         if ($cached !== false) {
             self::$remote_data = $cached;

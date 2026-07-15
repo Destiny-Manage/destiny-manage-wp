@@ -3,7 +3,7 @@
  * Plugin Name:  Destiny Manage
  * Plugin URI:   https://destinymanage.com
  * Description:  Connect your WordPress site to Destiny Manage for automated monitoring, plugin tracking, health reporting, and client management.
- * Version:      1.1.4
+ * Version:      1.1.6
  * Author:       Destiny Manage
  * Author URI:   https://destinymanage.com
  * License:      GPL-2.0+
@@ -16,7 +16,7 @@
 
 defined('ABSPATH') || exit;
 
-define('DM_VERSION',           '1.1.4');
+define('DM_VERSION',           '1.1.6');
 define('DM_SLUG',              'destiny-manage');
 define('DM_PLUGIN_FILE',       __FILE__);
 define('DM_PLUGIN_DIR',        plugin_dir_path(__FILE__));
@@ -59,6 +59,9 @@ function dm_add_cron_intervals(array $schedules): array {
 // Auto-updater
 add_filter('pre_set_site_transient_update_plugins', ['DM_Updater', 'check_update']);
 add_filter('plugins_api', ['DM_Updater', 'plugin_info'], 10, 3);
+// "Check Again" on Dashboard → Updates deletes WP's update transient; drop
+// our own cached version-check with it so a forced check is actually fresh.
+add_action('delete_site_transient_update_plugins', ['DM_Updater', 'flush_cache']);
 
 // Activation / deactivation
 register_activation_hook(__FILE__, 'dm_activate');
