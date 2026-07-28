@@ -32,7 +32,26 @@ class DM_Updater {
             return self::$remote_data;
         }
 
-        $response = DM_API::get_public(DM_UPDATE_URL);
+        // The standard connector can use public release metadata. Branded
+        // connectors authenticate with their site API key so the platform can
+        // verify that the owning workspace still has paid-plan access before
+        // issuing a short-lived branded package URL.
+        if (DM_PLUGIN_NAME === 'Destiny Manage') {
+            $response = DM_API::get_public(DM_UPDATE_URL);
+        } else {
+            $response = DM_API::get(str_replace(DM_API_BASE, '', DM_UPDATE_URL));
+            // A workspace that moves back to Free must still receive connector
+            // security and compatibility updates. The paid endpoint returns
+            // 403, so fall back to the standard package; installing that update
+            // removes the paid-only white-label name without breaking the
+            // existing site connection.
+            if (
+                is_wp_error($response)
+                && (int) ($response->get_error_data()['status'] ?? 0) === 403
+            ) {
+                $response = DM_API::get_public(DM_API_BASE . '/wordpress/plugin/info');
+            }
+        }
         if (is_wp_error($response) || empty($response['data'])) {
             return null;
         }
@@ -100,16 +119,16 @@ class DM_Updater {
         }
 
         $info                = new stdClass();
-        $info->name          = 'Destiny Manage';
+        $info->name          = DM_PLUGIN_NAME;
         $info->slug          = DM_SLUG;
         $info->version       = $remote->version ?? DM_VERSION;
         $info->tested        = $remote->tested ?? '';
         $info->requires      = $remote->requires ?? '6.0';
         $info->requires_php  = $remote->requires_php ?? '8.0';
-        $info->author        = '<a href="https://destinymanage.com">Destiny Manage</a>';
+        $info->author        = esc_html(DM_PLUGIN_NAME);
         $info->download_link = $remote->download_url ?? '';
         $info->sections      = (array) ($remote->sections ?? [
-            'description' => 'Connect your WordPress site to Destiny Manage.',
+            'description' => sprintf('Connect your WordPress site to %s.', DM_PLUGIN_NAME),
         ]);
 
         return $info;

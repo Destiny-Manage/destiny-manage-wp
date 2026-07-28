@@ -131,14 +131,17 @@ class DM_Commands {
         // poll only looks for "pending" commands — every command queued
         // after it in this same batch never even gets attempted.
         $finished = false;
-        register_shutdown_function(function () use ($site_id, $id, $slug, &$finished) {
+        register_shutdown_function(function () use ($site_id, $id, $slug, $type, &$finished) {
             if ($finished) {
                 return;
             }
+            $what = $type === 'create_backup' ? 'backing up this site' : "updating {$slug}";
             $fatal = error_get_last();
             $message = $fatal
-                ? "A fatal PHP error interrupted updating {$slug}: {$fatal['message']}. This can happen if the plugin is incompatible with this PHP version or requires a license/activation the update process can't satisfy."
-                : "The update process for {$slug} stopped unexpectedly without reporting a result.";
+                ? ($type === 'create_backup'
+                    ? "A fatal PHP error interrupted {$what}: {$fatal['message']}. Large sites can exhaust the server's memory or time limit while the archive is built."
+                    : "A fatal PHP error interrupted {$what}: {$fatal['message']}. This can happen if the plugin is incompatible with this PHP version or requires a license/activation the update process can't satisfy.")
+                : "The process for {$what} stopped unexpectedly without reporting a result.";
             DM_API::patch_with_retry("/wordpress/sites/{$site_id}/commands/{$id}", [
                 'status'        => 'failed',
                 'resultMessage' => $message,
@@ -165,6 +168,12 @@ class DM_Commands {
                 case 'rollback_theme':
                     [$result, $error] = self::rollback_theme($slug, $ver);
                     break;
+                case 'clear_cache':
+                    [$result, $error] = self::clear_cache();
+                    break;
+                case 'create_backup':
+                    [$result, $error] = self::create_backup($site_id, $command);
+                    break;
                 default:
                     $error = "Unknown command type: {$type}";
             }
@@ -175,7 +184,10 @@ class DM_Commands {
             $error = $e->getMessage();
         }
 
-        if ($error) {
+        // Backup/cache errors are already written in plain language and aren't
+        // about a specific plugin, so don't wrap them in the update-oriented
+        // "Could not update {slug}" phrasing.
+        if ($error && $type !== 'create_backup' && $type !== 'clear_cache') {
             $error = self::friendly_error_message($slug, $error);
         }
 
@@ -199,11 +211,562 @@ class DM_Commands {
         self::cleanup_old_backups();
     }
 
+    // -------------------------------------------------------------------------
+    // Cache clearing — host-agnostic purge matrix
+    // -------------------------------------------------------------------------
+
+    /**
+     * Purges every cache layer this site actually has, and reports which ones.
+     * Runs after updates (queued by the dashboard) and on the manual Clear
+     * cache button. Each purge is guarded so a missing or broken cache plugin
+     * never fails the command; "nothing to purge" is a success, not an error.
+     */
+    private static function clear_cache(): array {
+        $purged = [];
+
+        // SiteGround Optimizer: purge_everything() flushes the dynamic
+        // (NGINX) cache plus Memcached when enabled; fall back to the older
+        // helper names for old Speed Optimizer versions.
+        try {
+            if (class_exists('\SiteGround_Optimizer\Supercacher\Supercacher')) {
+                if (method_exists('\SiteGround_Optimizer\Supercacher\Supercacher', 'purge_everything')) {
+                    \SiteGround_Optimizer\Supercacher\Supercacher::purge_everything();
+                } else {
+                    \SiteGround_Optimizer\Supercacher\Supercacher::purge_cache();
+                }
+                $purged[] = 'SiteGround dynamic cache';
+            } elseif (function_exists('sg_cachepress_purge_everything')) {
+                sg_cachepress_purge_everything();
+                $purged[] = 'SiteGround dynamic cache';
+            } elseif (function_exists('sg_cachepress_purge_cache')) {
+                sg_cachepress_purge_cache();
+                $purged[] = 'SiteGround dynamic cache';
+            }
+        } catch (\Throwable $e) {
+            // Continue with the other layers; report at the end.
+        }
+
+        // WordPress object cache (memcached/redis drop-ins included).
+        try {
+            if (function_exists('wp_cache_flush') && wp_cache_flush()) {
+                $purged[] = 'object cache';
+            }
+        } catch (\Throwable $e) {
+        }
+
+        // Common page-cache plugins, each optional.
+        $page_caches = [
+            'WP Rocket'        => function () { if (function_exists('rocket_clean_domain')) { rocket_clean_domain(); return true; } return false; },
+            'LiteSpeed Cache'  => function () { if (has_action('litespeed_purge_all')) { do_action('litespeed_purge_all'); return true; } return false; },
+            'W3 Total Cache'   => function () { if (function_exists('w3tc_flush_all')) { w3tc_flush_all(); return true; } return false; },
+            'WP Super Cache'   => function () { if (function_exists('wp_cache_clear_cache')) { wp_cache_clear_cache(); return true; } return false; },
+            'WP Fastest Cache' => function () { if (function_exists('wpfc_clear_all_cache')) { wpfc_clear_all_cache(true); return true; } return false; },
+            'Autoptimize'      => function () { if (class_exists('autoptimizeCache')) { \autoptimizeCache::clearall(); return true; } return false; },
+        ];
+        foreach ($page_caches as $label => $purge) {
+            try {
+                if ($purge()) {
+                    $purged[] = $label;
+                }
+            } catch (\Throwable $e) {
+            }
+        }
+
+        if (empty($purged)) {
+            return ['No purgeable cache plugin found on this site; nothing needed clearing.', null];
+        }
+        return ['Purged: ' . implode(', ', $purged) . '.', null];
+    }
+
     /**
      * Rewrites raw upgrader/exception messages that look like a licensing
      * problem into something an agency can actually act on, while still
      * keeping the original message for troubleshooting.
      */
+    // -------------------------------------------------------------------------
+    // Full site + database backup
+    // -------------------------------------------------------------------------
+
+    /**
+     * Best-effort live progress report. A temporary dashboard/API outage must
+     * never abort a backup that can still finish and upload successfully.
+     */
+    private static function report_backup_progress(string $site_id, string $backup_id, string $stage, array $metrics = []): void {
+        $payload = array_merge(['stage' => $stage], $metrics);
+        DM_API::patch_with_retry(
+            "/wordpress/sites/{$site_id}/backups/{$backup_id}/progress",
+            $payload,
+            2
+        );
+    }
+
+    /**
+     * Build a full archive of the site's files and database and stream it to
+     * the destination drive via the Destiny Manage API (which holds the drive
+     * credentials — this connector never sees them). Returns [message, error]
+     * like the update handlers. The API finalizes the backup record when the
+     * final chunk lands.
+     */
+    private static function create_backup(string $site_id, array $command): array {
+        $backup_id = $command['backupId'] ?? '';
+        if (!$backup_id) {
+            return [null, sprintf('The dashboard did not provide a backup id. Update the %s connector and try again.', DM_PLUGIN_NAME)];
+        }
+
+        // Full-site archives are heavy; give the archiver as much room as the
+        // host allows. Both are best-effort — many managed hosts lock them.
+        @set_time_limit(0);
+        $limit = @ini_get('memory_limit');
+        if ($limit !== false && trim((string) $limit) !== '-1') {
+            @ini_set('memory_limit', '512M');
+        }
+
+        $work_dir = self::create_private_backup_work_dir();
+        if (is_wp_error($work_dir)) {
+            return [null, $work_dir->get_error_message()];
+        }
+
+        $sql_path = $work_dir . '/database.sql';
+        $zip_path = $work_dir . '/backup.zip';
+
+        try {
+            // Preflight: stop before we start writing anything if the server
+            // plainly can't finish — a clear "why" up front beats a half-written
+            // archive and a vague failure. Estimated size drives the disk check.
+            self::report_backup_progress($site_id, $backup_id, 'scanning_files');
+            [$files_size, $file_count] = self::estimate_backup_files($work_dir);
+            $pre_error  = self::preflight_backup($work_dir, $files_size);
+            if ($pre_error) {
+                return [null, $pre_error];
+            }
+
+            self::report_backup_progress($site_id, $backup_id, 'exporting_database', [
+                'sourceFilesBytes' => $files_size,
+                'sourceFileCount'  => $file_count,
+            ]);
+            $db_error = self::dump_database($sql_path);
+            if ($db_error) {
+                return [null, $db_error];
+            }
+
+            // Re-check disk now that we know the database dump size: the zip needs
+            // room roughly equal to the files plus the dump (media barely
+            // compresses, so assume no saving — better to over-reserve).
+            $db_size = (int) (@filesize($sql_path) ?: 0);
+            $needed  = $files_size + $db_size;
+            $free    = @disk_free_space($work_dir);
+            if ($free !== false && $needed > 0 && $free < $needed * 1.05) {
+                return [null, sprintf(
+                    'Not enough free disk space on the server to build the backup archive: about %s is needed but only %s is free. Free up space on the hosting account and run the backup again.',
+                    size_format((int) ($needed * 1.05)),
+                    size_format((int) $free)
+                )];
+            }
+
+            self::report_backup_progress($site_id, $backup_id, 'compressing', [
+                'sourceFilesBytes' => $files_size,
+                'sourceFileCount'  => $file_count,
+                'databaseBytes'    => $db_size,
+            ]);
+            $zip_error = self::build_backup_archive($zip_path, $sql_path, $work_dir);
+            if ($zip_error) {
+                return [null, $zip_error];
+            }
+
+            $archive_size = (int) (@filesize($zip_path) ?: 0);
+            self::report_backup_progress($site_id, $backup_id, 'uploading', [
+                'sourceFilesBytes' => $files_size,
+                'sourceFileCount'  => $file_count,
+                'databaseBytes'    => $db_size,
+                'archiveSizeBytes' => $archive_size,
+            ]);
+            $upload_error = self::upload_backup($site_id, $backup_id, $zip_path);
+            if ($upload_error) {
+                return [null, $upload_error];
+            }
+
+            $size  = $archive_size ?: @filesize($zip_path);
+            $human = $size ? size_format($size) : 'unknown size';
+            return ["Backup of files and database completed and uploaded to your connected drive ({$human}).", null];
+        } finally {
+            // Always remove the local temp artifacts, success or failure.
+            @unlink($sql_path);
+            @unlink($zip_path);
+            @rmdir($work_dir);
+        }
+    }
+
+    /**
+     * Create a unique 0700 workspace outside every known web root. Backup
+     * artifacts contain the database and wp-config.php, so an uploads-based
+     * directory protected only by .htaccess is unsafe on Nginx/static frontends.
+     */
+    private static function create_private_backup_work_dir(): string|WP_Error {
+        $candidates = array_filter(array_unique([
+            (string) @sys_get_temp_dir(),
+            (string) @ini_get('upload_tmp_dir'),
+            defined('WP_TEMP_DIR') ? (string) WP_TEMP_DIR : '',
+        ]));
+        $public_roots = array_filter(array_unique([
+            (string) ABSPATH,
+            defined('WP_CONTENT_DIR') ? (string) WP_CONTENT_DIR : '',
+            isset($_SERVER['DOCUMENT_ROOT']) ? (string) $_SERVER['DOCUMENT_ROOT'] : '',
+        ]));
+
+        foreach ($candidates as $candidate) {
+            $root = realpath($candidate);
+            if ($root === false || !is_dir($root) || !is_writable($root)) {
+                continue;
+            }
+            $is_public = false;
+            foreach ($public_roots as $public_root) {
+                if (self::path_is_within($root, $public_root)) {
+                    $is_public = true;
+                    break;
+                }
+            }
+            if ($is_public) {
+                continue;
+            }
+
+            try {
+                $suffix = bin2hex(random_bytes(16));
+            } catch (\Throwable $e) {
+                continue;
+            }
+            $work_dir = trailingslashit($root) . 'destiny-manage-backup-' . $suffix;
+            if (@mkdir($work_dir, 0700, false)) {
+                @chmod($work_dir, 0700);
+                return $work_dir;
+            }
+        }
+
+        return new WP_Error(
+            'dm_no_private_temp_dir',
+            'Could not find a private temporary directory outside the public website files. Ask the host to configure PHP upload_tmp_dir or WP_TEMP_DIR to a non-public writable directory, then run the backup again.'
+        );
+    }
+
+    private static function path_is_within(string $path, string $root): bool {
+        $path_real = realpath($path);
+        $root_real = realpath($root);
+        if ($path_real === false || $root_real === false) {
+            return false;
+        }
+        $path_normal = untrailingslashit(wp_normalize_path($path_real));
+        $root_normal = untrailingslashit(wp_normalize_path($root_real));
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $path_normal = strtolower($path_normal);
+            $root_normal = strtolower($root_normal);
+        }
+        return $path_normal === $root_normal || str_starts_with($path_normal, trailingslashit($root_normal));
+    }
+
+    /**
+     * Fail fast, with a specific reason, if the server can't complete a backup:
+     * missing Zip support or not enough free disk to hold the archive. Returns
+     * an error string, or null when it's safe to proceed.
+     */
+    private static function preflight_backup(string $work_dir, int $files_size): ?string {
+        if (!class_exists('ZipArchive')) {
+            return 'This server does not have the PHP Zip extension enabled, which is required to build a backup archive. Ask the host to enable it, then try again.';
+        }
+        // Reserve room for the file archive plus headroom for the database dump
+        // (unknown yet) — a rough 10% of the files, floored at 64MB.
+        $db_headroom = max(64 * 1024 * 1024, (int) ($files_size * 0.1));
+        $needed      = $files_size + $db_headroom;
+        $free        = @disk_free_space($work_dir);
+        if ($free !== false && $files_size > 0 && $free < $needed) {
+            return sprintf(
+                'Not enough free disk space on the server to build the backup: about %s is needed but only %s is free. Free up space on the hosting account and run the backup again.',
+                size_format($needed),
+                size_format((int) $free)
+            );
+        }
+        return null;
+    }
+
+    /** Count and sum every file that will go into the archive. */
+    private static function estimate_backup_files(string $work_dir): array {
+        $root      = untrailingslashit(ABSPATH);
+        $work_real = realpath($work_dir);
+        $excluded  = self::backup_excluded_paths();
+        $total     = 0;
+        $count     = 0;
+        try {
+            $it = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+            foreach ($it as $file) {
+                if (!$file->isFile()) {
+                    continue;
+                }
+                $path = $file->getPathname();
+                if ($work_real && strpos($path, $work_real) === 0) {
+                    continue;
+                }
+                $rel = ltrim(str_replace($root, '', $path), '/\\');
+                if ($rel === '' || self::path_is_excluded($rel, $excluded)) {
+                    continue;
+                }
+                $total += (int) $file->getSize();
+                $count++;
+            }
+        } catch (\Throwable $e) {
+            // If the estimate can't be computed, skip the disk guard rather than
+            // block the backup — the close()/write checks below still catch a
+            // genuine out-of-space condition, just later.
+            return [0, 0];
+        }
+        return [$total, $count];
+    }
+
+    /** True when exec() is available and not disabled on this host. */
+    private static function exec_available(): bool {
+        if (!function_exists('exec')) {
+            return false;
+        }
+        $disabled = array_map('trim', explode(',', (string) @ini_get('disable_functions')));
+        if (in_array('exec', $disabled, true)) {
+            return false;
+        }
+        return !filter_var(@ini_get('safe_mode'), FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /** Dump the database to $sql_path — mysqldump when possible, else PHP. */
+    private static function dump_database(string $sql_path): ?string {
+        if (self::exec_available()) {
+            [$host, $port, $socket] = self::parse_db_host((string) DB_HOST);
+            $parts = ['mysqldump', '--no-tablespaces', '--single-transaction', '--quick', '--skip-lock-tables'];
+            $parts[] = '--host=' . escapeshellarg($host);
+            if ($port)   { $parts[] = '--port=' . escapeshellarg($port); }
+            if ($socket) { $parts[] = '--socket=' . escapeshellarg($socket); }
+            $parts[] = '--user=' . escapeshellarg(DB_USER);
+            $parts[] = escapeshellarg(DB_NAME);
+            $parts[] = '--result-file=' . escapeshellarg($sql_path);
+            // Pass the password via the environment, not the argv, so it never
+            // shows up in the process list.
+            $cmd = 'MYSQL_PWD=' . escapeshellarg((string) DB_PASSWORD) . ' ' . implode(' ', $parts) . ' 2>/dev/null';
+            @exec($cmd, $out, $code);
+            if ($code === 0 && file_exists($sql_path) && filesize($sql_path) > 0) {
+                return null;
+            }
+            // mysqldump missing or refused — fall through to the PHP dump.
+        }
+        return self::dump_database_php($sql_path);
+    }
+
+    /** Split WordPress's DB_HOST into [host, port, socket]. */
+    private static function parse_db_host(string $db_host): array {
+        $socket = null;
+        $port   = null;
+        if (strpos($db_host, ':') !== false) {
+            [$host, $suffix] = explode(':', $db_host, 2);
+            if (is_numeric($suffix)) {
+                $port = $suffix;
+            } else {
+                $socket = $suffix; // unix socket path
+            }
+        } else {
+            $host = $db_host;
+        }
+        return [$host ?: 'localhost', $port, $socket];
+    }
+
+    /** Portable database dump using $wpdb when mysqldump isn't available. */
+    private static function dump_database_php(string $sql_path): ?string {
+        global $wpdb;
+        $fh = @fopen($sql_path, 'w');
+        if (!$fh) {
+            return 'Could not write the database dump file.';
+        }
+        // fwrite returns the bytes written, or false/short on a full disk. A
+        // helper that throws on any short write turns "silently truncated dump"
+        // into a clear out-of-space error.
+        $write = static function ($data) use ($fh): void {
+            $len     = strlen($data);
+            $written = fwrite($fh, $data);
+            if ($written === false || $written < $len) {
+                throw new \RuntimeException('disk_full');
+            }
+        };
+        try {
+            $write(sprintf("-- %s backup\nSET FOREIGN_KEY_CHECKS=0;\n", DM_PLUGIN_NAME));
+            $tables = $wpdb->get_col('SHOW TABLES');
+            foreach ($tables as $table) {
+                $create = $wpdb->get_row("SHOW CREATE TABLE `{$table}`", ARRAY_N);
+                if (!$create || !isset($create[1])) {
+                    continue;
+                }
+                $write("\nDROP TABLE IF EXISTS `{$table}`;\n" . $create[1] . ";\n");
+                $offset = 0;
+                $batch  = 500;
+                do {
+                    $rows = $wpdb->get_results("SELECT * FROM `{$table}` LIMIT {$offset}, {$batch}", ARRAY_A);
+                    foreach ($rows as $row) {
+                        $cols = array_map(fn($c) => "`{$c}`", array_keys($row));
+                        $vals = array_map(function ($v) {
+                            return is_null($v) ? 'NULL' : "'" . esc_sql($v) . "'";
+                        }, array_values($row));
+                        $write("INSERT INTO `{$table}` (" . implode(',', $cols) . ') VALUES (' . implode(',', $vals) . ");\n");
+                    }
+                    $offset += $batch;
+                } while (count($rows) === $batch);
+            }
+            $write("SET FOREIGN_KEY_CHECKS=1;\n");
+        } catch (\RuntimeException $e) {
+            fclose($fh);
+            return 'Ran out of disk space on the server while writing the database dump. Free up space on the hosting account and run the backup again.';
+        } finally {
+            if (is_resource($fh)) {
+                fclose($fh);
+            }
+        }
+        return null;
+    }
+
+    /** Relative path prefixes excluded from the file archive. */
+    private static function backup_excluded_paths(): array {
+        return [
+            'wp-content/cache',
+            'wp-content/upgrade',
+            'wp-content/dm-backups',          // this connector's per-plugin rollback backups
+            'wp-content/uploads/dm-backup-tmp' // our own in-progress archive
+        ];
+    }
+
+    private static function path_is_excluded(string $rel, array $excluded): bool {
+        $rel = str_replace('\\', '/', $rel);
+        foreach ($excluded as $prefix) {
+            if ($rel === $prefix || strpos($rel, $prefix . '/') === 0) {
+                return true;
+            }
+        }
+        // Never archive VCS or dependency dirs anywhere in the tree.
+        if (preg_match('#(^|/)(\.git|node_modules)(/|$)#', $rel)) {
+            return true;
+        }
+        return false;
+    }
+
+    /** Zip the whole install (minus excludes) plus the DB dump. */
+    private static function build_backup_archive(string $zip_path, string $sql_path, string $work_dir): ?string {
+        if (!class_exists('ZipArchive')) {
+            return 'The PHP Zip extension is not available on this server, so a backup archive cannot be built.';
+        }
+        $zip = new ZipArchive();
+        if ($zip->open($zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+            return 'Could not create the backup archive file.';
+        }
+        $zip->addFile($sql_path, 'database.sql');
+
+        $root      = untrailingslashit(ABSPATH);
+        $work_real = realpath($work_dir);
+        $excluded  = self::backup_excluded_paths();
+
+        try {
+            $it = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+            foreach ($it as $file) {
+                $path = $file->getPathname();
+                // Skip our own temp working dir (holds the growing zip + sql).
+                if ($work_real && strpos($path, $work_real) === 0) {
+                    continue;
+                }
+                $rel = ltrim(str_replace($root, '', $path), '/\\');
+                if ($rel === '' || self::path_is_excluded($rel, $excluded)) {
+                    continue;
+                }
+                if ($file->isDir()) {
+                    $zip->addEmptyDir($rel);
+                } elseif ($file->isFile() && $file->isReadable()) {
+                    $zip->addFile($path, $rel);
+                }
+            }
+        } catch (\Throwable $e) {
+            $zip->close();
+            return 'Failed while reading site files for the backup: ' . $e->getMessage();
+        }
+
+        // ZipArchive writes the actual file data on close(), so a full disk
+        // during compression surfaces here as close() === false, not earlier.
+        if ($zip->close() !== true) {
+            @unlink($zip_path);
+            return 'Ran out of disk space (or could not write) while compressing the backup archive on the server. Free up space on the hosting account and run the backup again.';
+        }
+        if (!file_exists($zip_path) || filesize($zip_path) === 0) {
+            return 'The backup archive came out empty.';
+        }
+        return null;
+    }
+
+    /**
+     * Stream the archive to the API. Two-phase: first ask the API to open the
+     * destination upload session — it returns the exact chunk size this
+     * provider requires (Google 256KB multiples, Microsoft Graph 320KB, Box a
+     * server-dictated part size, Dropbox 8MB) — then stream chunks of that size.
+     * The whole-file SHA-1 (needed only for Box's commit) is computed once and
+     * sent on every chunk so the API has it when the final part lands.
+     */
+    private static function upload_backup(string $site_id, string $backup_id, string $zip_path): ?string {
+        $total = filesize($zip_path);
+        if ($total === false || $total <= 0) {
+            return 'The backup archive was missing right before upload.';
+        }
+
+        // Phase 1: open the session and learn the required chunk size.
+        $session = DM_API::post("/wordpress/sites/{$site_id}/backups/{$backup_id}/upload-session", [
+            'sizeBytes' => $total,
+        ]);
+        if (is_wp_error($session)) {
+            return 'Could not start the upload to the destination: ' . $session->get_error_message();
+        }
+        $chunk_size = (int) ($session['data']['chunkSize'] ?? 0);
+        if ($chunk_size <= 0) {
+            $chunk_size = 8 * 1024 * 1024; // safe default
+        }
+
+        // SHA-1 of the whole archive, base64-encoded (Box commit integrity check).
+        $file_sha = @sha1_file($zip_path, true);
+        $file_sha_b64 = $file_sha !== false ? base64_encode($file_sha) : '';
+
+        // Phase 2: stream the archive in chunks of exactly $chunk_size.
+        $fh = @fopen($zip_path, 'rb');
+        if (!$fh) {
+            return 'Could not open the backup archive for upload.';
+        }
+        $offset = 0;
+        try {
+            while (!feof($fh)) {
+                $data = fread($fh, $chunk_size);
+                if ($data === false) {
+                    return 'Could not read the backup archive during upload.';
+                }
+                $len = strlen($data);
+                if ($len === 0) {
+                    break;
+                }
+                $is_final = ($offset + $len) >= $total;
+                $res = DM_API::post_binary("/wordpress/sites/{$site_id}/backups/{$backup_id}/parts", $data, [
+                    'X-Backup-Offset'     => (string) $offset,
+                    'X-Backup-Total-Size' => (string) $total,
+                    'X-Backup-Final'      => $is_final ? '1' : '0',
+                    'X-Backup-File-Sha'   => $file_sha_b64,
+                ]);
+                if (is_wp_error($res)) {
+                    return 'Upload to the destination failed: ' . $res->get_error_message();
+                }
+                $offset += $len;
+            }
+        } finally {
+            fclose($fh);
+        }
+        return null;
+    }
+
     private static function friendly_error_message(string $slug, string $raw_message): string {
         $haystack = strtolower($raw_message);
         // Messages this class crafted itself are already actionable — don't
@@ -280,6 +843,16 @@ class DM_Commands {
         $prev_version = get_plugins()[$plugin_file]['Version'] ?? 'unknown';
         $new_version  = $updates[$plugin_file]->update->new_version ?? 'unknown';
 
+        // WordPress's own Plugin_Upgrader silently DEACTIVATES an active plugin
+        // before upgrading it (deactivate_plugin_before_upgrade) on any request
+        // that isn't WP-Cron — which is exactly the path the dashboard's instant
+        // "update now" takes (a REST loopback, not cron). It never turns the
+        // plugin back on afterwards, so without the reactivation below a healthy
+        // update would leave the plugin — including this connector, when it
+        // updates itself — switched off. Remember the state going in so every
+        // exit path can put it back the way it found it.
+        $was_active = is_plugin_active($plugin_file);
+
         // Back up current plugin directory before touching anything
         $plugin_dir = WP_PLUGIN_DIR . '/' . explode('/', $plugin_file)[0];
         $backup     = self::backup_directory($plugin_dir, 'plugin', $slug, $prev_version);
@@ -288,10 +861,12 @@ class DM_Commands {
         $result   = $upgrader->upgrade($plugin_file);
 
         if (is_wp_error($result)) {
+            self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after a failed update');
             self::remove_backup($backup);
             return [null, $result->get_error_message()];
         }
         if ($result === false) {
+            self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after a failed update');
             self::remove_backup($backup);
             return [null, "Plugin update failed (no error returned)."];
         }
@@ -299,13 +874,12 @@ class DM_Commands {
         // Health check: does the site still respond after the update?
         $health = self::site_health_check();
         if (!$health['ok']) {
-            // Site is broken — restore immediately from backup
+            // Site is broken — restore the previous version and leave it active.
             self::restore_from_backup($backup, $plugin_dir);
-            // Re-activate plugin if it was active
-            activate_plugin($plugin_file);
+            self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after rolling a broken update back');
             return [
                 null,
-                "Update to v{$new_version} caused site to return HTTP {$health['code']} — auto-rolled back to v{$prev_version}. Original error: {$health['message']}"
+                "Update to v{$new_version} caused the site to return HTTP {$health['code']} — automatically rolled back to v{$prev_version} and left active. Original error: {$health['message']}"
             ];
         }
 
@@ -315,9 +889,18 @@ class DM_Commands {
         // having delivered something even newer than the transient promised.
         $installed_version = self::installed_plugin_version($plugin_file);
         if (!$installed_version || version_compare($installed_version, $new_version, '<')) {
+            // The version didn't move, but WordPress may still have deactivated
+            // it on the way in — don't leave it off over a no-op update.
+            self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after an update that did not change the version');
             return [null, self::version_mismatch_message('Update', $new_version, $installed_version)];
         }
 
+        // Healthy update: keep the new version, but make sure WordPress didn't
+        // quietly leave the plugin switched off behind our back.
+        $reactivated = self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after updating it');
+
+        // Reactivation is logged on-site (see reactivate_if_needed) but not
+        // surfaced in the result — it's routine housekeeping, not news.
         $backup_note = $backup ? "Backed up v{$prev_version} before updating. " : "";
         return ["{$backup_note}Updated {$slug} from v{$prev_version} to v{$installed_version}.", null];
     }
@@ -440,47 +1023,72 @@ class DM_Commands {
         self::load_upgrade_functions();
 
         $plugin_file  = self::find_plugin_file($slug);
+        $was_active   = $plugin_file ? is_plugin_active($plugin_file) : false;
         $prev_version = $plugin_file ? (get_plugins()[$plugin_file]['Version'] ?? 'unknown') : 'unknown';
         $plugin_dir   = WP_PLUGIN_DIR . '/' . $slug;
-        $backup       = is_dir($plugin_dir) ? self::backup_directory($plugin_dir, 'plugin', $slug, $prev_version) : null;
 
-        $download_url = "https://downloads.wordpress.org/plugin/{$slug}.{$version}.zip";
-        $upgrader     = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
-        $result       = $upgrader->install($download_url, ['overwrite_package' => true]);
+        // Prefer a local backup of the target version, captured when the site
+        // updated away from it. This is the only way to roll back plugins that
+        // are not on WordPress.org — including this connector and licensed
+        // plugins — and it avoids a network download for everything else.
+        $target_backup = self::find_backup('plugin', $slug, $version);
 
-        if (is_wp_error($result)) {
-            if ($backup) self::remove_backup($backup);
-            return [null, $result->get_error_message()];
-        }
-        if ($result === false) {
-            if ($backup) self::remove_backup($backup);
-            return [null, "Rollback failed. Version {$version} may not be on WordPress.org."];
+        // Safety backup of the current build so a broken rollback can be undone.
+        $safety = is_dir($plugin_dir) ? self::backup_directory($plugin_dir, 'plugin', $slug, $prev_version) : null;
+
+        if ($target_backup) {
+            if (is_dir($plugin_dir)) {
+                self::remove_dir($plugin_dir);
+            }
+            self::copy_dir($target_backup, $plugin_dir);
+            $source_note = "from a local backup";
+        } else {
+            $download_url = "https://downloads.wordpress.org/plugin/{$slug}.{$version}.zip";
+            $upgrader     = new Plugin_Upgrader(new Automatic_Upgrader_Skin());
+            $result       = $upgrader->install($download_url, ['overwrite_package' => true]);
+
+            if (is_wp_error($result)) {
+                if ($safety) self::remove_backup($safety);
+                return [null, $result->get_error_message()];
+            }
+            if ($result === false) {
+                if ($safety) self::remove_backup($safety);
+                return [null, "Rollback failed: no local backup of v{$version} exists and it may not be on WordPress.org."];
+            }
+            $source_note = "from WordPress.org";
         }
 
-        if ($plugin_file) {
-            activate_plugin($plugin_file);
-        }
+        // Keep it active if it was active going in (a deliberate rollback of an
+        // active plugin should stay usable); a plugin the agency had switched
+        // off stays off.
+        self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after rolling it back');
 
         $health = self::site_health_check();
         if (!$health['ok']) {
             // Rolled-back version also broken — restore the pre-rollback state
-            if ($backup) {
-                self::restore_from_backup($backup, WP_PLUGIN_DIR . '/' . $slug);
+            if ($safety) {
+                self::restore_from_backup($safety, $plugin_dir);
             }
+            self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after restoring it');
             return [
                 null,
-                "Rollback to v{$version} also caused HTTP {$health['code']} — restored v{$prev_version}. Manual intervention required."
+                "Rollback to v{$version} also caused HTTP {$health['code']} — restored v{$prev_version} and left it active. Manual intervention required."
             ];
         }
 
         $installed_file    = self::find_plugin_file($slug);
         $installed_version = $installed_file ? self::installed_plugin_version($installed_file) : null;
         if ($installed_version !== $version) {
+            // Never strand the site: put the pre-rollback build back.
+            if ($safety) self::restore_from_backup($safety, $plugin_dir);
+            self::reactivate_if_needed($plugin_file, $was_active, $slug, 'after a rollback that did not change the version');
             return [null, self::version_mismatch_message('Rollback', $version, $installed_version)];
         }
 
-        $backup_note = $backup ? "Backed up v{$prev_version} before rolling back. " : "";
-        return ["{$backup_note}Rolled back {$slug} to v{$version}.", null];
+        // Success: the target backup is kept for future reuse; drop the safety
+        // backup of the build we just moved off.
+        if ($safety) self::remove_backup($safety);
+        return ["Rolled back {$slug} from v{$prev_version} to v{$version} {$source_note}.", null];
     }
 
     // -------------------------------------------------------------------------
@@ -497,21 +1105,37 @@ class DM_Commands {
         $themes       = wp_get_themes();
         $prev_version = isset($themes[$slug]) ? $themes[$slug]->get('Version') : 'unknown';
         $theme_dir    = get_theme_root() . '/' . $slug;
-        $backup       = is_dir($theme_dir) ? self::backup_directory($theme_dir, 'theme', $slug, $prev_version) : null;
 
-        $download_url = "https://downloads.wordpress.org/theme/{$slug}.{$version}.zip";
-        $upgrader     = new Theme_Upgrader(new Automatic_Upgrader_Skin());
-        $result       = $upgrader->install($download_url, ['overwrite_package' => true]);
+        // Prefer a local backup of the target version (see rollback_plugin).
+        $target_backup = self::find_backup('theme', $slug, $version);
+        $safety        = is_dir($theme_dir) ? self::backup_directory($theme_dir, 'theme', $slug, $prev_version) : null;
 
-        if (is_wp_error($result)) {
-            if ($backup) self::remove_backup($backup);
-            return [null, $result->get_error_message()];
+        if ($target_backup) {
+            if (is_dir($theme_dir)) {
+                self::remove_dir($theme_dir);
+            }
+            self::copy_dir($target_backup, $theme_dir);
+            $source_note = "from a local backup";
+        } else {
+            $download_url = "https://downloads.wordpress.org/theme/{$slug}.{$version}.zip";
+            $upgrader     = new Theme_Upgrader(new Automatic_Upgrader_Skin());
+            $result       = $upgrader->install($download_url, ['overwrite_package' => true]);
+
+            if (is_wp_error($result)) {
+                if ($safety) self::remove_backup($safety);
+                return [null, $result->get_error_message()];
+            }
+            if ($result === false) {
+                if ($safety) self::remove_backup($safety);
+                return [null, "Rollback failed: no local backup of v{$version} exists and it may not be on WordPress.org."];
+            }
+            $source_note = "from WordPress.org";
         }
 
         $health = self::site_health_check();
         if (!$health['ok']) {
-            if ($backup) {
-                self::restore_from_backup($backup, $theme_dir);
+            if ($safety) {
+                self::restore_from_backup($safety, $theme_dir);
             }
             return [
                 null,
@@ -521,11 +1145,12 @@ class DM_Commands {
 
         $installed_version = self::installed_theme_version($slug);
         if ($installed_version !== $version) {
+            if ($safety) self::restore_from_backup($safety, $theme_dir);
             return [null, self::version_mismatch_message('Rollback', $version, $installed_version)];
         }
 
-        $backup_note = $backup ? "Backed up v{$prev_version} before rolling back. " : "";
-        return ["{$backup_note}Rolled back theme {$slug} to v{$version}.", null];
+        if ($safety) self::remove_backup($safety);
+        return ["Rolled back theme {$slug} from v{$prev_version} to v{$version} {$source_note}.", null];
     }
 
     // -------------------------------------------------------------------------
@@ -592,6 +1217,41 @@ class DM_Commands {
         }
 
         return $dest;
+    }
+
+    /**
+     * Newest local backup directory matching a type/slug/version, or null.
+     * Backups are named "{type}-{slug}-{version}-{timestamp}" by
+     * backup_directory(), so rollback can restore an exact earlier build
+     * without fetching anything from WordPress.org.
+     */
+    private static function find_backup(string $type, string $slug, string $version): ?string {
+        $root = self::backup_root();
+        if (!is_dir($root)) {
+            return null;
+        }
+
+        $best    = null;
+        $best_ts = -1;
+        foreach (scandir($root) as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            if (!preg_match('/^(plugin|theme)-(.+?)-([\d.]+)-(\d+)$/', $name, $m)) {
+                continue;
+            }
+            if ($m[1] !== $type || $m[2] !== $slug || $m[3] !== $version) {
+                continue;
+            }
+            $ts   = (int) $m[4];
+            $path = $root . '/' . $name;
+            if ($ts > $best_ts && is_dir($path)) {
+                $best    = $path;
+                $best_ts = $ts;
+            }
+        }
+
+        return $best;
     }
 
     private static function restore_from_backup(?string $backup, string $dest): void {
@@ -708,5 +1368,50 @@ class DM_Commands {
             }
         }
         return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Keep-active + on-site log
+    // -------------------------------------------------------------------------
+
+    /**
+     * WordPress's Plugin_Upgrader deactivates an active plugin before upgrading
+     * it (deactivate_plugin_before_upgrade) and never turns it back on. If the
+     * plugin was active before we started and WordPress has since switched it
+     * off, silently re-enable it. Silent (4th arg) means we only restore the
+     * "active" flag and do NOT re-run the plugin's activation hook — it was
+     * already set up when first activated, and re-running it during a self-
+     * update could have unwanted side effects. Logs the correction either way,
+     * so "why did my plugin turn itself off after an update?" has an answer.
+     * Returns true only when it actually had to reactivate.
+     */
+    private static function reactivate_if_needed(?string $plugin_file, bool $was_active, string $slug, string $context): bool {
+        if (!$plugin_file || !$was_active || is_plugin_active($plugin_file)) {
+            return false;
+        }
+        activate_plugin($plugin_file, '', false, true); // 4th arg: silent
+        self::record_log($slug, "Re-enabled {$slug} {$context}: WordPress switches a plugin off while updating it and does not turn it back on.");
+        return true;
+    }
+
+    /**
+     * Append to a small on-site activity log in the options table, newest first
+     * and capped so it can't grow without bound. This is the local record of
+     * anything the update flow had to correct (a plugin WordPress left disabled,
+     * a rollback); the same note also travels to Destiny Manage in the command's
+     * result message, so both the site and the dashboard have a trail.
+     */
+    private static function record_log(string $slug, string $message): void {
+        $log = get_option('dm_activity_log', []);
+        if (!is_array($log)) {
+            $log = [];
+        }
+        array_unshift($log, [
+            'time'    => gmdate('c'),
+            'slug'    => $slug,
+            'message' => $message,
+        ]);
+        // autoload = false: diagnostics, not needed on every page load.
+        update_option('dm_activity_log', array_slice($log, 0, 50), false);
     }
 }

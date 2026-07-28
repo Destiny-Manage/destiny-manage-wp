@@ -11,7 +11,9 @@ class DM_Collector {
      * Called on activation if an API key is set, or after saving settings.
      */
     public static function register_site(): array|WP_Error {
-        $site_name = get_option('dm_site_name', get_bloginfo('name'));
+        // Name comes from WordPress itself; the legacy dm_site_name option
+        // still wins when an older install set it explicitly.
+        $site_name = get_option('dm_site_name') ?: get_bloginfo('name');
         $site_url  = get_site_url();
 
         $result = DM_API::post('/wordpress/sites', [
@@ -70,6 +72,7 @@ class DM_Collector {
      */
     public static function collect(): array {
         return [
+            'siteName'   => get_option('dm_site_name') ?: get_bloginfo('name'),
             'wpVersion'  => self::wp_version(),
             'phpVersion' => PHP_VERSION,
             'plugins'    => self::plugins(),
@@ -94,16 +97,34 @@ class DM_Collector {
         $active_plugins = get_option('active_plugins', []);
         $updates        = get_plugin_updates();
 
+        // Premium plugins whose updates are held back by a license problem do
+        // not appear in get_plugin_updates(), so detect them separately.
+        $blocked = class_exists('DM_Licenses') ? DM_Licenses::detect($all_plugins) : [];
+
         $result = [];
         foreach ($all_plugins as $file => $data) {
             $slug = explode('/', $file)[0];
+
+            $block       = $blocked[$file] ?? null;
+            $is_blocked  = !empty($block['updateBlocked']);
+            $new_version = $updates[$file]->update->new_version ?? null;
+            if ($is_blocked && !empty($block['newVersion'])) {
+                $new_version = $block['newVersion'];
+            }
+
             $result[] = [
                 'slug'            => $slug,
                 'name'            => $data['Name'],
                 'version'         => $data['Version'],
                 'active'          => in_array($file, $active_plugins, true),
-                'updateAvailable' => isset($updates[$file]),
-                'newVersion'      => $updates[$file]->update->new_version ?? null,
+                // A blocked premium update counts as available so it surfaces
+                // instead of hiding behind "up to date"; updateBlocked marks it
+                // as needing a license fix rather than a one-click update.
+                'updateAvailable' => isset($updates[$file]) || $is_blocked,
+                'newVersion'      => $new_version,
+                'updateBlocked'   => $is_blocked,
+                'blockedReason'   => $is_blocked ? ($block['blockedReason'] ?? 'license') : null,
+                'licenseStatus'   => $block['licenseStatus'] ?? null,
             ];
         }
 

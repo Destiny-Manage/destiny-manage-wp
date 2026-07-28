@@ -10,8 +10,8 @@ class DM_Settings {
 
     public static function add_menu(): void {
         add_options_page(
-            __('Destiny Manage', 'destiny-manage'),
-            __('Destiny Manage', 'destiny-manage'),
+            DM_PLUGIN_NAME,
+            DM_PLUGIN_NAME,
             'manage_options',
             'destiny-manage',
             [self::class, 'render_page']
@@ -38,8 +38,9 @@ class DM_Settings {
         }
         echo '<div class="notice notice-warning is-dismissible"><p>'
             . sprintf(
-                /* translators: %s: settings page URL */
-                __('<strong>Destiny Manage</strong>: Enter your API key on the <a href="%s">settings page</a> to start syncing.', 'destiny-manage'),
+                /* translators: 1: white-label plugin name, 2: settings page URL */
+                __('<strong>%1$s</strong>: Enter your API key on the <a href="%2$s">settings page</a> to start syncing.', 'destiny-manage'),
+                esc_html(DM_PLUGIN_NAME),
                 esc_url(admin_url('options-general.php?page=destiny-manage'))
             )
             . '</p></div>';
@@ -71,8 +72,18 @@ class DM_Settings {
         }
         ?>
         <div class="wrap">
-            <h1><?php esc_html_e('Destiny Manage', 'destiny-manage'); ?></h1>
-            <p><?php esc_html_e('Connect this WordPress site to your Destiny Manage account for monitoring, plugin tracking, and client management.', 'destiny-manage'); ?></p>
+            <h1><?php echo esc_html(DM_PLUGIN_NAME); ?></h1>
+            <p>
+                <?php
+                echo esc_html(
+                    sprintf(
+                        /* translators: %s: white-label plugin name */
+                        __('Connect this WordPress site to your %s account for monitoring, plugin tracking, and client management.', 'destiny-manage'),
+                        DM_PLUGIN_NAME
+                    )
+                );
+                ?>
+            </p>
 
             <?php if ($site_id): ?>
             <div style="background:#d1fae5;border:1px solid #6ee7b7;padding:10px 14px;border-radius:6px;margin-bottom:16px;">
@@ -109,9 +120,10 @@ class DM_Settings {
                                 <?php
                                 echo wp_kses(
                                     sprintf(
-                                        /* translators: %s: Destiny Manage dashboard URL */
-                                        __('Generate a key in your <a href="%s" target="_blank" rel="noopener">Destiny Manage dashboard → API Keys</a>.', 'destiny-manage'),
-                                        'https://www.destinymanage.com/account/api-keys'
+                                        /* translators: 1: dashboard URL, 2: white-label plugin name */
+                                        __('Generate a key in your <a href="%1$s" target="_blank" rel="noopener">%2$s dashboard → API Keys</a>.', 'destiny-manage'),
+                                        'https://www.destinymanage.com/account/api-keys',
+                                        esc_html(DM_PLUGIN_NAME)
                                     ),
                                     ['a' => ['href' => [], 'target' => [], 'rel' => []]]
                                 );
@@ -119,20 +131,18 @@ class DM_Settings {
                             </p>
                         </td>
                     </tr>
-                    <tr>
-                        <th scope="row"><label for="dm_site_name"><?php esc_html_e('Site display name', 'destiny-manage'); ?></label></th>
-                        <td>
-                            <input
-                                type="text"
-                                id="dm_site_name"
-                                name="dm_site_name"
-                                value="<?php echo esc_attr($site_name); ?>"
-                                class="regular-text"
-                            />
-                            <p class="description"><?php esc_html_e('How this site appears in your Destiny Manage dashboard.', 'destiny-manage'); ?></p>
-                        </td>
-                    </tr>
                 </table>
+                <p class="description">
+                    <?php
+                    echo esc_html(
+                        sprintf(
+                            /* translators: %s: white-label plugin name */
+                            __('The site connects using its WordPress site title and address automatically. Changing the site title in WordPress settings updates it in %s on the next sync.', 'destiny-manage'),
+                            DM_PLUGIN_NAME
+                        )
+                    );
+                    ?>
+                </p>
                 <?php submit_button(__('Save settings', 'destiny-manage')); ?>
             </form>
 
